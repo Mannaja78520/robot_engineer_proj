@@ -1,8 +1,7 @@
-DH_table = [[0,     0,     	0.0892,     -90 + thf.get(0)],
-                [90,     0,          0,     90 + thf.get(1)],
-                [0,       0.4251,    0,        thf.get(2)],
-                [0,       0.3922,    0.110,      -90 + thf.get(3)],
-                [-90,       0,    0.0948,        thf.get(4)],
-                [90,       0,    0.07495,        thf.get(5)],
-                [0,       0,    0.19163,        180]
-                ]
+T_01 = dh_transform_matrix(0.0      , 0.0      , 0.0892 , theta1 - np.pi/2)
+T_12 = dh_transform_matrix(np.pi/2  , 0.0      , 0.0    , theta2 + np.pi/2)
+T_23 = dh_transform_matrix(0.0      , 0.4251   , 0.0    , theta3          )
+T_34 = dh_transform_matrix(0.0      , 0.39215  , 0.11   , theta4 + np.pi/2)
+T_56 = dh_transform_matrix(-np.pi/2 , 0.0      , 0.26658, theta6          )
+T_45 = dh_transform_matrix(np.pi/2  , 0.0      , 0.09475, theta5          )
+T_6E = np.eye(4)
