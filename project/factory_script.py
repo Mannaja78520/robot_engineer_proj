@@ -33,10 +33,10 @@ def sysCall_thread():
         p = 45*pi/180*np.sin(0.2*pi*t);
 #        p = np.pi/2
         
-        for i in range(0,5):       
+        for i in range(0,6):       
             sim.setJointTargetPosition(hdl_j[i],p)
          
-        for i in range(0,5):
+        for i in range(0,6):
             th[i] = round(sim.getJointPosition(hdl_j[i])*r2d,2)
             # print (th[i])
             
