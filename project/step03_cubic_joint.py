@@ -512,6 +512,338 @@ def run_leg(sim, aux, hdl_j, hdl_end, q_from, q_to, target_pos, target_eul_rad, 
         if s >= 1.0:
             break
         sim.switchThread()
+        
+# ===================== Self-collision (coarse) =====================
+# แทนแต่ละลิงก์เป็นทรงกลมที่เฟรมหลัก แล้วห้ามวงกลมที่ไม่ใช่เพื่อนบ้านชนกัน
+SELF_SPHERE_IDX   = [3, 4, 5, 6, 7]                       # indices ใน T_list (หลัง joint2..joint6)
+SELF_SPHERE_RADII = np.array([0.072, 0.072, 0.063, 0.054, 0.054], float) * 0.90  # เผื่อ safety
+SELF_PAIR_SKIP_NEIGHBOR = True
+BASE_RADIUS_APPROX = 0.0085      # รัศมีฐานโดยประมาณ (กันท่อนล่างไปชนฐาน)
+CLEAR_MARGIN = 0.010            # margin เพิ่มเติม
+PATH_SAMPLES = 5              # จำนวนจุดเช็ค self-collision ระหว่างทาง
+GROUND_Z = 0.0          # ระดับพื้นโลก (CoppeliaSim ปกติคือ z=0)
+GROUND_MARGIN = 0.010   # กันไว้ 10 มม. (ปรับได้)
+
+# (ปรับช่วงมุมเพื่อลดท่าพับเกินจริง)
+ELBOW_RANGE_DEG    = (-170.0, -5.0)   # q2
+FOREARM_RANGE_DEG  = (-160.0, -5.0)   # q3
+
+def _deg_ok(q, lohi_deg):
+    lo, hi = np.deg2rad(lohi_deg[0]), np.deg2rad(lohi_deg[1])
+    return (q >= lo) and (q <= hi)
+
+def is_pose_self_clear(theta):
+    # """ห้ามทรงกลม non-adjacent ชนกัน + ไม่ให้วงกลมไปเฉี่ยวฐาน + บังคับช่วงมุม q2,q3"""
+    th = ang_wrap_vec(theta)
+    q2, q3 = th[1], th[2]
+    if (not _deg_ok(q2, ELBOW_RANGE_DEG)) or (not _deg_ok(q3, FOREARM_RANGE_DEG)):
+        return False
+
+    T_list, _ = _chain_from_DH(th)
+    P = [T_list[i][:3, 3].copy() for i in SELF_SPHERE_IDX]
+    R = SELF_SPHERE_RADII
+
+    # กันฐาน
+    for p, r in zip(P, R):
+        rho = math.hypot(float(p[0]), float(p[1]))
+        if rho < (BASE_RADIUS_APPROX + r - CLEAR_MARGIN):
+            return False
+
+    # ทรงกลมชนกันเอง (non-adjacent)
+    for i in range(len(P)):
+        for j in range(i+1, len(P)):
+            if SELF_PAIR_SKIP_NEIGHBOR and (j == i+1):
+                continue
+            dij = float(np.linalg.norm(P[i] - P[j]))
+            if dij < (R[i] + R[j] - CLEAR_MARGIN):
+                return False
+    return True
+
+def is_path_self_clear(q0, qf, samples=PATH_SAMPLES):
+    q0 = ang_wrap_vec(np.asarray(q0, float))
+    qf = ang_wrap_vec(np.asarray(qf, float))
+    for s in np.linspace(0.0, 1.0, samples):
+        qt = ang_wrap_vec((1.0 - s) * q0 + s * qf)
+        if not is_pose_self_clear(qt):
+            return False
+    return True
+
+# ===================== สุ่มมุมเริ่ม–สุดท้ายในช่วงที่เหมาะสม =====================
+# ช่วง "เหมาะสม" (แกนฐานปล่อยกว้าง, ไหล่/ศอกเน้นค่าลบให้แขนเหยียดออก, ข้อมือปล่อยหลวม)
+JOINT_RANGE_DEG = [
+    (-160, 160),   # q1 base
+    (-110, -45),   # q2 shoulder (ไม่ให้ใกล้สุดพิสัย)
+    (-130, -35),   # q3 elbow
+    (-80,   80),   # q4 wrist1
+    (-120, 120),   # q5 wrist2
+    (-170, 170),   # q6 wrist3
+]
+
+def rand_joint_biased():
+    q = np.zeros(6, float)
+    for i, (lo, hi) in enumerate(JOINT_RANGE_DEG):
+        q[i] = np.deg2rad(np.random.uniform(lo, hi))
+    # เติม noise นิดหน่อย
+    q += np.deg2rad(np.random.normal(0.0, 4.0, size=6))
+    return ang_wrap_vec(clamp_q(q))
+
+# ===================== Cubic polynomial trajectory =====================
+def cubic_coeffs(q0, qf, T):
+    # คิวบิก v(0)=v(T)=0 ต่อข้อ; คืนค่าสัมประสิทธิ์ a0..a3 รูปทรง (6,4)
+    q0 = np.asarray(q0, float); qf = np.asarray(qf, float)
+    dq = qf - q0
+    a0 = q0
+    a1 = np.zeros_like(q0)
+    a2 = 3.0 * dq / (T*T)
+    a3 = -2.0 * dq / (T*T*T)
+    return np.column_stack([a0, a1, a2, a3])
+
+def cubic_eval(coeffs, t):
+    a0, a1, a2, a3 = coeffs[:,0], coeffs[:,1], coeffs[:,2], coeffs[:,3]
+    q   = a0 + a1*t + a2*(t*t) + a3*(t*t*t)
+    dq  = a1 + 2*a2*t + 3*a3*(t*t)
+    ddq = 2*a2 + 6*a3*t
+    return q, dq, ddq
+
+def choose_T_with_accel(q0, qf, amax_each, T_hint):
+    # เลือก T ให้ไม่เกิน amax ของแต่ละแกน: T >= max_i sqrt(6*|dq_i|/amax_i) และ T >= T_hint
+    q0 = np.asarray(q0, float); qf = np.asarray(qf, float)
+    amax_each = np.asarray(amax_each, float)
+    dq = np.abs(ang_wrap_vec(qf - q0))
+    T_req_per_joint = np.where(amax_each > 0, np.sqrt(np.where(dq > 0, 6.0*dq/amax_each, 0.0)), 0.0)
+    T_req = float(np.max(T_req_per_joint))
+    return max(T_req, float(T_hint))
+
+SAFETY_MODE = 'warn'  # 'strict' = หยุดทันทีเมื่อเจอชน, 'warn' = แจ้งเตือนแล้วไปต่อ
+
+def drive_q(sim, hdl_j, q):
+    qn = ang_wrap_vec(q)
+    for i in range(6):
+        try:    sim.setJointTargetPosition(hdl_j[i], float(qn[i]))
+        except: pass
+        try:    sim.setJointPosition(hdl_j[i], float(qn[i]))
+        except: pass
+
+def run_leg_cubic(sim, aux, hdl_j, hdl_end, q_from, q_to, T_move, label):
+    coeffs = cubic_coeffs(q_from, q_to, T_move)
+    t0 = sim.getSimulationTime()
+    last_log = -1.0
+    log_once(sim, aux, f"{label} start cubic (T={T_move:5.2f}s)")
+    warned = False
+    while True:
+        t_now = sim.getSimulationTime()
+        t = t_now - t0
+        if t < 0.0: t = 0.0
+        if t > T_move: t = T_move
+        q_cmd, dq_cmd, ddq_cmd = cubic_eval(coeffs, t)
+
+        ok_self = is_pose_self_clear(q_cmd)
+        if SAFETY_MODE != 'off':
+            ok_self = is_pose_self_clear(q_cmd)
+            if not ok_self:
+                if SAFETY_MODE == 'strict':
+                    log_once(sim, aux, f"{label} ABORT: self-collision risk at t={t_now:6.2f}s")
+                    break
+                elif not warned:
+                    log_once(sim, aux, f"{label} WARN: self-collision check failed at t={t_now:6.2f}s (mode=warn)")
+                    warned = True
+
+        drive_q(sim, hdl_j, q_cmd)
+
+        if (last_log < 0) or (t_now - last_log > 0.25):
+            sim_pos = sim.getObjectPosition(hdl_end, -1)
+            sim_eul = sim.getObjectOrientation(hdl_end, -1)
+            s = t/T_move if T_move>0 else 1.0
+            msg = []
+            msg.append(f"{label} s={s:5.2f} t={t_now:6.2f}s")
+            msg.append("  q_cmd(deg):     " + ", ".join(f"{x*r2d:7.2f}" for x in q_cmd))
+            msg.append("  dq_cmd(deg/s):  " + ", ".join(f"{x*r2d:7.2f}" for x in dq_cmd))
+            msg.append("  ddq_cmd(deg/s2):" + ", ".join(f"{x*r2d:7.2f}" for x in ddq_cmd))
+            msg.append("  sim_pos:        " + ", ".join(f"{x:7.4f}" for x in sim_pos))
+            msg.append("  sim_eul(deg):   " + ", ".join(f"{x*r2d:7.2f}" for x in sim_eul))
+            log_once(sim, aux, "\n".join(msg))
+            last_log = t_now
+
+        if t >= T_move: break
+        sim.switchThread()
+
+def scale_until_self_safe(q_from, q_to, max_halves=8, min_move_deg=10.0):
+    # ย่อสโตก q_from→q_to ทีละครึ่งจนทางปลอดภัย; บังคับให้ขยับขั้นต่ำต่อแกน >= min_move_deg
+    q_from = ang_wrap_vec(np.asarray(q_from, float))
+    q_goal = ang_wrap_vec(np.asarray(q_to,   float))
+    q_try  = q_goal.copy()
+    ok_scaled = False
+    for _ in range(max_halves):
+        if is_path_self_clear(q_from, q_try):
+            break
+        q_try = ang_wrap_vec(q_from + 0.5*(q_try - q_from))
+        ok_scaled = True
+    dq = ang_wrap_vec(q_try - q_from)
+    for i in range(6):
+        if abs(dq[i])*r2d < min_move_deg:
+            sgn = 1.0 if dq[i] >= 0.0 else -1.0
+            dq[i] = sgn * (min_move_deg*d2r)
+    q_try = ang_wrap_vec(clamp_q(q_from + dq))
+    return q_try, ok_scaled
+
+def sample_pair_no_self_collision(joint_min_deg=50.0, tries=800):
+    # """พยายามหลายระดับ:
+    #    L0: เคร่งสุด = ท่า A/B ผ่าน และ 'ทั้งทาง' ผ่าน
+    #    L1: ผ่อนบางอย่าง (ลด PATH_SAMPLES, CLEAR_MARGIN เล็กน้อย) แล้วลองใหม่
+    #    L2: หา A/B ที่ท่าผ่าน แล้ว 'ย่อสโตก' ให้ทางปลอดภัยแน่ ๆ """
+    # L0: เคร่ง
+    for _ in range(tries):
+        qA = rand_joint_biased()
+        if not is_pose_self_clear(qA): continue
+        for _ in range(tries//3):
+            qB = rand_joint_biased()
+            if not is_pose_self_clear(qB): continue
+            if float(np.linalg.norm(ang_wrap_vec(qB - qA)))*r2d < joint_min_deg: continue
+            if is_path_self_clear(qA, qB):
+                return qA, qB
+
+    # L1: ผ่อนเล็กน้อยเฉพาะตอนตรวจทาง
+    samples_backup = globals().get("PATH_SAMPLES", 11)
+    margin_backup  = globals().get("CLEAR_MARGIN", 0.02)
+    try:
+        globals()["PATH_SAMPLES"] = max(7, samples_backup//2)
+        globals()["CLEAR_MARGIN"] = max(0.012, margin_backup*0.7)
+        for _ in range(tries):
+            qA = rand_joint_biased()
+            if not is_pose_self_clear(qA): continue
+            for _ in range(tries//3):
+                qB = rand_joint_biased()
+                if not is_pose_self_clear(qB): continue
+                if float(np.linalg.norm(ang_wrap_vec(qB - qA)))*r2d < (joint_min_deg-10): continue
+                if is_path_self_clear(qA, qB):
+                    return qA, qB
+    finally:
+        globals()["PATH_SAMPLES"] = samples_backup
+        globals()["CLEAR_MARGIN"] = margin_backup
+
+    # L2: หา A/B ที่ท่าผ่าน แล้ว 'ย่อสโตก' ให้ทางปลอดภัย
+    for _ in range(tries):
+        qA = rand_joint_biased()
+        if not is_pose_self_clear(qA): continue
+        for _ in range(tries//2):
+            qB = rand_joint_biased()
+            if not is_pose_self_clear(qB): continue
+            if float(np.linalg.norm(ang_wrap_vec(qB - qA)))*r2d < (joint_min_deg-20): continue
+            qB_safe, scaled = scale_until_self_safe(qA, qB, max_halves=8, min_move_deg=8.0)
+            if is_path_self_clear(qA, qB_safe):
+                return qA, qB_safe
+    return None, None
+
+def sample_two_poses_poses_only(joint_min_deg=25.0, tries=4000):
+    # สุ่ม qA, qB ที่ 'แต่ละท่า' ผ่าน self-collision (ยังไม่บังคับทาง)
+    for _ in range(tries):
+        qA = rand_joint_biased()
+        if not is_pose_self_clear(qA):
+            continue
+        for _ in range(tries//3):
+            qB = rand_joint_biased()
+            if not is_pose_self_clear(qB):
+                continue
+            if float(np.linalg.norm(ang_wrap_vec(qB - qA)))*r2d < joint_min_deg:
+                continue
+            return qA, qB
+    return None, None
+
+def pick_safe_pair_or_scale(joint_min_deg=20.0, max_tries=6000):
+    # 1) พยายามแบบเข้มก่อน (ได้เร็วก็จบ)
+    qA, qB = sample_pair_no_self_collision(joint_min_deg=max(joint_min_deg, 30.0), tries=max_tries)
+    if (qA is not None) and (qB is not None):
+        return qA, qB
+
+    # 2) สุ่มหาท่า A ที่ "ปลอดภัยแน่ๆ" (เฉพาะโพส)
+    qA = None
+    for _ in range(max_tries):
+        q = rand_joint_biased()
+        if is_pose_self_clear(q):
+            qA = q; break
+    if qA is None:
+        return None, None
+
+    # 3) สร้าง B จาก A ด้วยเดลต้าแบบคุมปริมาณ แล้ว "ย่อสโตก" จนทางปลอดภัย
+    for _ in range(max_tries):
+        step_deg = np.array([40, 25, 25, 30, 40, 40], float)
+        step = np.deg2rad(step_deg) * np.random.uniform(0.8, 1.2, size=6) * np.sign(np.random.randn(6))
+        qB_try = ang_wrap_vec(clamp_q(qA + step))
+        if not is_pose_self_clear(qB_try):
+            continue
+        qB_safe, _ = scale_until_self_safe(qA, qB_try, max_halves=8, min_move_deg=8.0)
+        if is_path_self_clear(qA, qB_safe):
+            return qA, qB_safe
+    return None, None
+
+def guaranteed_pair_from_mid():
+    # """
+    # สร้าง qA กลางช่วง + ทำ qB = qA + step คุมปริมาณ
+    # แล้วบังคับย่อสโตกจนเส้นทางปลอดภัย — ต้องได้ผลเสมอถ้าขอบเขตไม่ขัดกัน
+    # """
+    mid = np.deg2rad(np.array([
+        0.0,                      # q1
+        (ELBOW_RANGE_DEG[0]+ELBOW_RANGE_DEG[1])/2.0,
+        (FOREARM_RANGE_DEG[0]+FOREARM_RANGE_DEG[1])/2.0,
+        0.0, 0.0, 0.0
+    ], float))
+    qA = ang_wrap_vec(clamp_q(mid))
+    # ถ้าโพสกลางยังไม่ผ่าน ให้ขยับฐานเล็กน้อยวนหา
+    for base_deg in [0, 20, -20, 45, -45, 70, -70, 110, -110, 150, -150]:
+        q_try = qA.copy()
+        q_try[0] = ang_wrap(q_try[0] + np.deg2rad(base_deg))
+        if is_pose_self_clear(q_try):
+            qA = q_try
+            break
+    if not is_pose_self_clear(qA):
+        return None, None
+
+    # กำหนดก้าวปลอดภัยสำหรับแต่ละแกน
+    step_deg = np.array([35, 22, 22, 25, 35, 35], float)
+    for _ in range(80):
+        sgn = np.sign(np.random.randn(6)); sgn[sgn==0] = 1.0
+        step = np.deg2rad(step_deg) * np.random.uniform(0.8, 1.2, size=6) * sgn
+        qB_try = ang_wrap_vec(clamp_q(qA + step))
+        if not is_pose_self_clear(qB_try):
+            continue
+        qB_safe, _ = scale_until_self_safe(qA, qB_try, max_halves=10, min_move_deg=6.0)
+        if is_path_self_clear(qA, qB_safe):
+            return qA, qB_safe
+    # ทางตัน: ลดก้าวลงแล้วลองอีกรอบ
+    step_deg_small = np.array([20, 15, 15, 18, 25, 25], float)
+    for _ in range(120):
+        sgn = np.sign(np.random.randn(6)); sgn[sgn==0] = 1.0
+        step = np.deg2rad(step_deg_small) * np.random.uniform(0.9, 1.1, size=6) * sgn
+        qB_try = ang_wrap_vec(clamp_q(qA + step))
+        if not is_pose_self_clear(qB_try):
+            continue
+        qB_safe, _ = scale_until_self_safe(qA, qB_try, max_halves=12, min_move_deg=5.0)
+        if is_path_self_clear(qA, qB_safe):
+            return qA, qB_safe
+    return None, None
+
+# ===== ground-only safety (no self-collision) =====
+def is_pose_self_clear(theta):
+    th = ang_wrap_vec(theta)
+    T_list, _ = _chain_from_DH(th)
+
+    # ตรวจลิสต์จุดแทนลิงก์ + ปลายมือ (EE)
+    check_ids = SELF_SPHERE_IDX + [len(T_list) - 1]  # EE index = ตัวสุดท้าย
+    for idx in check_ids:
+        z = float(T_list[idx][2, 3])  # world z
+        if z < (GROUND_Z + GROUND_MARGIN):
+            return False
+    return True
+
+def is_path_self_clear(q0, qf, samples=PATH_SAMPLES):
+    q0 = ang_wrap_vec(np.asarray(q0, float))
+    qf = ang_wrap_vec(np.asarray(qf, float))
+    for s in np.linspace(0.0, 1.0, samples):
+        qt = ang_wrap_vec((1.0 - s)*q0 + s*qf)
+        if not is_pose_self_clear(qt):
+            return False
+    return True
+# ==================================================
 
 # ===================== Hooks ของ CoppeliaSim =====================
 def sysCall_init():
@@ -519,8 +851,8 @@ def sysCall_init():
 
 def sysCall_thread():
     sim = require("sim")
-    
-    # ดึง handle ข้อต่อและปลายมือ
+
+    # ---------- Handles ----------
     hdl_j = {}
     hdl_j[0] = sim.getObject("/UR5/joint")
     hdl_j[1] = sim.getObject("/UR5/joint/link/joint")
@@ -530,139 +862,87 @@ def sysCall_thread():
     hdl_j[5] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint")
     hdl_end = sim.getObject("/UR5/EndPoint")
 
-    # เปิดคอนโซลแสดงผล
+    # ---------- Console ----------
     global aux
-    AUX_MAX_LINES = 3000
-    AUX_SIZE = [1120, 820]
-    AUX_POS  = [10, 10]
     aux = sim.auxiliaryConsoleOpen(
-        'UR5 IK via DLS (priority+polish, numeric J) | sim_pos/eul | J_used',
-        AUX_MAX_LINES, 0, AUX_POS, AUX_SIZE, [1,1,1], [0,0,0]
+        'UR5 Joint-space Cubic (direct, self-safe)',
+        3000, 0, [16,16], [980,800], [1,1,1], [0,0,0]
     )
 
-    # เตรียมวัตถุเป้าในซีน
-    h_cube = get_or_create_target_cube(sim)
+    # ---------- พารามิเตอร์ตามโจทย์ ----------
+    # 1) กำหนดช่วงเวลา T ที่ต้องการ (ถ้าไม่พอเพราะ amax ระบบจะขยายเวลาเองให้ปลอดภัย)
+    T_HINT = 10.0        # วินาที (คุณปรับได้)
+    HOLD_START = 3.0
+    HOLD_END   = 3.0
 
-    # ค่าพารามิเตอร์ของตัวแก้ IK (ปรับได้)
-    MAX_ITERS = 1000
-    TOL_POS   = 1e-4
-    TOL_ORI   = 2e-3
-    DQ_MAX    = 14.0*d2r
+    # 2) กำหนดความเร่งเชิงมุมสูงสุดของแต่ละ joint (deg/s^2) แล้วแปลงเป็น rad/s^2
+    amax_each_deg = np.array([80, 80, 80, 120, 160, 180], float)
+    amax_each     = np.deg2rad(amax_each_deg)
 
-    # เซ็ตชุดทดสอบเป้าหมาย
-    tests = [
-        ([0.33,  0.25, 0.10], [  0.0,   0.0,   0.0]),
-        ([0.45,  0.10, 0.65], [  0.0,  20.0,  30.0]),
-        ([0.35, -0.25, 0.70], [ 30.0, -25.0,  60.0]),
-        ([0.55,  0.20, 0.55], [-20.0,  15.0, -40.0]),
-        ([0.40,  0.00, 0.80], [ 90.0,   0.0,   0.0]),
-        ([0.50,  0.15, 0.60], [ 10.0, -30.0,  45.0]),
-        ([0.20, -0.10, 0.75], [-90.0,   0.0, 180.0]),
-    ]
+    # 3) จำนวนกรณีในการสุ่มจุดเริ่ม–จุดจบ
+    NUM_CASES = 3
 
-    log_once(sim, aux, "UR5 IK via DLS (priority + nullspace + final polish, numeric J)")
-    log_once(sim, aux, "="*100)
+    log_once(sim, aux, f"[DEMO] Joint-space cubic (direct-only) — cases={NUM_CASES}")
+    log_once(sim, aux, "  amax_each(deg/s^2): " + ", ".join(f"{x:.0f}" for x in amax_each_deg))
+    # log_once(sim, aux, f"  T_HINT={T_HINT:.2f}s (จะถูกขยายถ้าจำเป็นจาก amax)")
 
-    # สร้าง solver ที่ล็อกพารามิเตอร์ไว้ (lambda) — ไม่ต้องประกาศฟังก์ชันย่อยในเธรดแล้ว
-    _solver = lambda qs, pt, Rt: ik_priority_dls(
-        qs, pt, Rt,
-        max_iters=MAX_ITERS, tol_pos=TOL_POS, tol_ori=TOL_ORI,
-        lam_pos0=0.02, lam_ori0=0.02, dq_max=DQ_MAX,
-        ko_base=0.06, w_null=0.08, warmup=True, do_polish=True
-    )
+    for case in range(1, NUM_CASES+1):
+        # พยายามแบบเข้ม -> poses-only -> ตัวเลือกสุดท้ายแบบการันตี
+        qA, qB = sample_pair_no_self_collision(joint_min_deg=30.0, tries=5000)
+        if (qA is None) or (qB is None):
+            qA, qB = sample_two_poses_poses_only(joint_min_deg=25.0, tries=4000)
+            if (qA is None) or (qB is None):
+                qA, qB = pick_safe_pair_or_scale(joint_min_deg=20.0, max_tries=6000)
+                if (qA is None) or (qB is None):
+                    # ⬇️ ultimate fallback (deterministic-ish)
+                    qA, qB = guaranteed_pair_from_mid()
+                    if (qA is None) or (qB is None):
+                        log_once(sim, aux, f"[Case {case}] ERROR: หา A/B ที่ปลอด self-collision ไม่เจอ — ยกเลิก")
+                        break
+                    else:
+                        log_once(sim, aux, f"[Case {case}] fallback: deterministic mid-pose + scaled")
+                else:
+                    log_once(sim, aux, f"[Case {case}] fallback: guaranteed pair (A safe + scaled B)")
+            else:
+                log_once(sim, aux, f"[Case {case}] fallback: poses-only, จะย่อสโตกเพื่อให้ทางปลอดภัย")
 
-    # วิ่งทุกเคสทดสอบ
-    for ti, (p_t, eul_deg) in enumerate(tests, 1):
-        # ตั้งค่าการมองเห็นในซีน
-        eul_rad = (np.array(eul_deg)*d2r).tolist()
-        sim.setObjectPosition(h_cube, -1, p_t)
-        sim.setObjectOrientation(h_cube, -1, eul_rad)
+        # รายงานก่อนวิ่ง
+        log_once(sim, aux, f"[Case {case}] qA(deg): " + ", ".join(f"{x*r2d:7.2f}" for x in qA))
+        log_once(sim, aux, f"[Case {case}] qB(deg): " + ", ".join(f"{x*r2d:7.2f}" for x in qB))
 
-        # อ่านเป้าที่ใช้งานจริงจากซีน
-        p_target = np.array(sim.getObjectPosition(h_cube, -1), float)
-        eul_xyz  = np.array(sim.getObjectOrientation(h_cube, -1), float)
-        R_target = eulXYZ_to_R(eul_xyz)
+        # ถ้าทางตรงยังไม่ปลอดภัย ให้ย่อสโตก (คุณมีอยู่แล้ว)
+        if not is_path_self_clear(qA, qB):
+            log_once(sim, aux, f"[Case {case}] NOTE: ทางตรง A→B ยังไม่ปลอดภัย จะย่อสโตกอัตโนมัติ")
+            qB, _ = scale_until_self_safe(qA, qB, max_halves=8, min_move_deg=8.0)
+            log_once(sim, aux, f"[Case {case}] qB'(deg): " + ", ".join(f"{x*r2d:7.2f}" for x in qB))
+        
+        # เวลาเดิน (เคารพ amax; ถ้า T_HINT สั้นเกินจะถูกขยาย)
+        T_AB = choose_T_with_accel(qA, qB, amax_each, T_HINT)
+        log_once(sim, aux, f"[Case {case}] T_AB={T_AB:.2f}s")
 
-        # สถานะปัจจุบันของข้อต่อ
-        q_now = np.array([sim.getJointPosition(hdl_j[i]) for i in range(6)], float)
-
-        log_once(sim, aux, f"[Test {ti}] TARGET pos=({p_target[0]:.4f}, {p_target[1]:.4f}, {p_target[2]:.4f}) "
-                 f"eulXYZ(deg)=({eul_xyz[0]*r2d: .2f}, {eul_xyz[1]*r2d: .2f}, {eul_xyz[2]*r2d: .2f})")
-
-        # เลือก approach และแก้ IK ครั้งแรก (ใช้รายงาน/สำรอง)
-        q_sol0, iters0, perr0, oerr0, ok0, chosen = try_ik_with_fallback(q_now, p_target, eul_deg, _solver, force_mode=None)
-
-        # รายงานโหมดและ Euler ที่เลือก
-        log_once(sim, aux, f"[Test {ti}] TO pos=({p_target[0]:.4f},{p_target[1]:.4f},{p_target[2]:.4f}) "
-                 f"MODE={chosen['mode']} target_eulXYZ(deg)=("
-                 f"{chosen['eul'][0]*r2d: .2f},{chosen['eul'][1]*r2d: .2f},{chosen['eul'][2]*r2d: .2f})")
-
-        # วางแผน pre-approach จากท่าปัจจุบัน
-        R_cmd = chosen['R']
-        q_start = np.array([sim.getJointPosition(hdl_j[i]) for i in range(6)], float)
-        (pre_P, pre_Q), (fin_P, fin_Q), ok_path = plan_pre_and_target(q_start, p_target, R_cmd, _solver)
-
-        # เดินงาน: direct หรือสองช่วง (PRE -> TARGET)
-        if not ok_path:
-            run_leg(sim, aux, hdl_j, hdl_end, q_start, q_sol0, p_target,
-                    rotation_matrix_to_euler(R_cmd), f"[Test {ti}][LEG: direct]")
-            q_sol = q_sol0
-            iters, perr, oerr, ok = iters0, perr0, oerr0, ok0
-        else:
-            run_leg(sim, aux, hdl_j, hdl_end, q_start, pre_Q, pre_P,
-                    rotation_matrix_to_euler(R_cmd), f"[Test {ti}][LEG 1: to PRE]")
-
-            # ค้างก่อนเข้าเป้าเล็กน้อย
-            t_pre_hold = sim.getSimulationTime()
-            while sim.getSimulationTime() - t_pre_hold < 0.4:
-                for i in range(6):
-                    sim.setJointTargetPosition(hdl_j[i], float(pre_Q[i]))
-                sim.switchThread()
-
-            run_leg(sim, aux, hdl_j, hdl_end, pre_Q, fin_Q, p_target,
-                    rotation_matrix_to_euler(R_cmd), f"[Test {ti}][LEG 2: to TARGET]")
-
-            q_sol = fin_Q
-            # คำนวณ error จริงเทียบกับ R_cmd
-            p_cur, _, Tcur = ur5_forward_kinematrix(q_sol)
-            R_cur = Tcur[:3,:3]
-            perr = float(np.linalg.norm(p_target - p_cur))
-            ew   = R_cur @ log_SO3(R_cmd @ R_cur.T)
-            oerr = float(np.linalg.norm(ew))
-            ok   = (perr < TOL_POS) and (oerr < TOL_ORI)
-            iters = iters0
-
-        # ค้างที่จุดเป้า
-        t_hold_start = sim.getSimulationTime()
-        while sim.getSimulationTime() - t_hold_start < DWELL_TIME:
-            for i in range(6):
-                sim.setJointTargetPosition(hdl_j[i], float(q_sol[i]))
+        # เทเลพอร์ตนิ่ม ๆ ไป A
+        t0 = sim.getSimulationTime()
+        while sim.getSimulationTime() - t0 < 0.7:
+            drive_q(sim, hdl_j, qA)
             sim.switchThread()
 
-        # สรุปผล/แสดง J ที่ใช้
-        sim_pos  = sim.getObjectPosition(hdl_end, -1)
-        sim_eul  = sim.getObjectOrientation(hdl_end, -1)
-        fk_pos, fk_eul, _ = ur5_forward_kinematrix(q_sol)
+        # รอตรงจุดเริ่ม (A) ก่อนออกตัว
+        t_holdA = sim.getSimulationTime()
+        while sim.getSimulationTime() - t_holdA < HOLD_START:
+            drive_q(sim, hdl_j, qA)
+            sim.switchThread()
 
-        msg = []
-        msg.append("  target_pos:      " + ", ".join(f"{x:7.4f}" for x in p_target))
-        msg.append("  target_eul(deg): " + ", ".join(f"{x:7.2f}" for x in (eul_xyz*r2d)))
-        msg.append(f"[Test {ti}] Reached target and dwelled {DWELL_TIME:.2f}s")
-        msg.append(f"  -> IK {'OK' if ok else 'NOT CONVERGED'} in {iters} iters")
-        msg.append(f"     |ep|={perr:.6f} m, |eo|={oerr:.6f} rad")
-        msg.append("  Solution q(deg): " + ", ".join(f"{x*r2d:7.2f}" for x in q_sol))
-        msg.append("  sim_pos:         " + ", ".join(f"{x:7.4f}" for x in sim_pos))
-        msg.append("  sim_eul(deg):    " + ", ".join(f"{x*r2d:7.2f}" for x in sim_eul))
-        msg.append("  FK pos:          " + ", ".join(f"{x:7.4f}" for x in fk_pos))
-        msg.append("  FK eulXYZ(deg):  " + ", ".join(f"{x:7.2f}" for x in (fk_eul*r2d)))
-        Jnum = jacobian_numeric(q_sol)
-        msg.append("  Jacobian USED (numeric):")
-        for r in range(6):
-            msg.append("    " + " ".join(f"{Jnum[r,c]: 8.5f}" for c in range(6)))
-        log_once(sim, aux, "\n".join(msg))
-        log_once(sim, aux, "-"*100)
+        # วิ่ง A → B แบบ cubic
+        run_leg_cubic(sim, aux, hdl_j, hdl_end, qA, qB, T_AB, f"[Case {case}] A→B")
 
-    log_once(sim, aux, "All tests finished.")
+        # รอตรงจุดจบ (B)
+        t_holdB = sim.getSimulationTime()
+        while sim.getSimulationTime() - t_holdB < HOLD_END:
+            drive_q(sim, hdl_j, qB)
+            sim.switchThread()
+
+        log_once(sim, aux, f"[Case {case}] done\n" + "-"*90)
+    log_once(sim, aux, "[DEMO] all done.")
 
 def sysCall_actuation():
     pass
