@@ -1,0 +1,24 @@
+ลิ้ง video step01:
+https://www.youtube.com/watch?v=vytjJilzzv0
+
+ลิ้ง video step02:
+step02 code and explanation of the function วิชา robot_engineer พุฒิพงศ์ วงศ์จันทร์ติ๊บ 660610840:
+https://youtu.be/BMsPjDQ6f38
+step02 results for various positions of the targeted cuboid พุฒิพงศ์ วงศ์จันทร์ติ๊บ 660610840:
+https://youtu.be/WYYsnhY0PEA
+
+ลิ้ง video step03:
+step03 cubic joint วิชา robot engineer พุฒิพงศ์ วงศ์จันทร์ติ๊บ 660610840:
+https://youtu.be/W8X2Twsy-Wg
+step03 blend joint วิชา robot engineer พุฒิพงศ์ วงศ์จันทร์ติ๊บ 660610840:
+https://youtu.be/g125ZgK_hQk
+step03 cubic task วิชา robot engineer พุฒิพงศ์ วงศ์จันทร์ติ๊บ 660610840:
+https://youtu.be/zxMB3S7aU4Y
+step03 blend task วิชา robot engineer พุฒิพงศ์ วงศ์จันทร์ติ๊บ 660610840:
+https://youtu.be/KMhRkCnYQ_A
+
+ลิ้ง video step04:
+final scene วิชา robot engineer พุฒิพงศ์ วงศ์จันทร์ติ๊บ 660610840:
+https://youtu.be/ks8wrpitPlA
+ลิ้ง GitHub:
+https://github.com/Mannaja78520/robot_engineer_proj.git
